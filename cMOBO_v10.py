@@ -18,10 +18,18 @@ Objectives (maximize):
 Constraint / feasibility:
   - Surface Instability (0|1)  -> interpret via FEASIBLE_VALUE
 
-Models:
-  - LogisticRegression for P(feasible|x)
-  - Two SingleTaskGP (Ms, Yield) -> ModelListGP
-  - Acquisition: qNEHVI(x) * P(feasible|x)^power
+Models and recommendation:
+  - LogisticRegression for P(feasible|x), with a constant-probability fallback
+  - Two independent SingleTaskGP models for standardized Ms and Yield
+  - ModelListGP trained with SumMarginalLogLikelihood
+  - qNEHVI evaluated independently for each LHS candidate (q = 1)
+  - Candidate score: qNEHVI(x) * P(feasible|x)^gamma
+  - The TOP_K highest-scoring individual candidates form the next batch
+
+Visualization:
+  - The final surrogate landscape uses all valid observations
+  - The third design coordinate is interpolated using a thin-plate-spline RBF
+  - The displayed landscape is not the qNEHVI acquisition function
 """
 
 import os
@@ -47,9 +55,16 @@ TOP_K = 5
 N_CANDIDATES = 8000
 FEAS_WEIGHT_POWER = 1.0
 
-# landscape visualization settings (from v2-1)
+# Reproducibility settings used by the objective models and qNEHVI
+OBSERVATION_VARIANCE = 1e-4
+N_QMC_SAMPLES = 128
+REF_POINT_MARGIN = 0.2
+FEAS_PROB_FLOOR = 1e-6
+
+# Landscape visualization settings
 N_GRID = 140
 PCT_LOW, PCT_HIGH = 40, 100
+RBF_SMOOTHING = 0.035
 
 # ===================== COLUMN NAMES =====================
 COL_RATIO_FE3_FE2 = "Fe3+|Fe2+"
@@ -149,10 +164,12 @@ def import_botorch():
         from botorch.acquisition.multi_objective.monte_carlo import (
             qNoisyExpectedHypervolumeImprovement as qNEHVI
         )
-    except Exception:
-        from botorch.acquisition.multi_objective.monte_carlo import (
-            qLogNoisyExpectedHypervolumeImprovement as qNEHVI
-        )
+    except ImportError as exc:
+        raise ImportError(
+            "This script requires BoTorch with "
+            "qNoisyExpectedHypervolumeImprovement. "
+            "Install a compatible BoTorch release before running it."
+        ) from exc
 
     return dict(
         gpytorch=gpytorch,
@@ -277,10 +294,14 @@ def main():
     train_Y2 = torch.tensor(y_y_std.reshape(-1, 1), dtype=dtype)
 
     def make_gp(tx, ty):
+        observation_variance = torch.full_like(ty, OBSERVATION_VARIANCE)
         try:
-            return SingleTaskGP(tx, ty, train_Yvar=torch.full_like(ty, 1e-4))
-        except TypeError:
-            return SingleTaskGP(tx, ty)
+            return SingleTaskGP(tx, ty, train_Yvar=observation_variance)
+        except TypeError as exc:
+            raise TypeError(
+                "The installed BoTorch version does not support train_Yvar. "
+                "Use a compatible version to preserve the fixed-noise model."
+            ) from exc
 
     model_ms = make_gp(train_X, train_Y1)
     model_y = make_gp(train_X, train_Y2)
@@ -293,22 +314,33 @@ def main():
 
     # ---------- acquisition ----------
     Y_base = torch.cat([train_Y1, train_Y2], dim=-1)
-    ref_point = (Y_base.min(dim=0).values - 0.2).tolist()
+    ref_point = (Y_base.min(dim=0).values - REF_POINT_MARGIN).tolist()
 
     try:
-        sampler = SobolQMCNormalSampler(sample_shape=torch.Size([128]))
+        sampler = SobolQMCNormalSampler(sample_shape=torch.Size([N_QMC_SAMPLES]))
     except TypeError:
-        sampler = SobolQMCNormalSampler(num_samples=128)
+        sampler = SobolQMCNormalSampler(num_samples=N_QMC_SAMPLES)
 
     acq = build_qnehvi_version_robust(
         qNEHVI_cls=qNEHVI, model=model, ref_point=ref_point,
         train_X=train_X, sampler=sampler,
     )
 
+    print("Objective models: two fixed-noise SingleTaskGP models in ModelListGP")
+    print(f"Observation variance: {OBSERVATION_VARIANCE:g}")
+    print(f"Acquisition: {qNEHVI.__name__}, evaluated with q = 1")
+    print(f"Sobol QMC samples: {N_QMC_SAMPLES}")
+    print(f"Reference point: {ref_point}")
+    print(f"LHS candidates: {N_CANDIDATES}; selected candidates: {TOP_K}")
+
     # ---------- Candidates ----------
+    # Each candidate is evaluated independently with q = 1.
+    # The top-ranked individual candidates are then selected as one batch.
     Xcand = lhs(N_CANDIDATES, d=3, seed=SEED + 1)
     p_feas_raw = p_feas_fn(Xcand)
-    p_feas_pow = np.clip(p_feas_raw, 1e-6, 1.0) ** FEAS_WEIGHT_POWER
+    p_feas_pow = (
+        np.clip(p_feas_raw, FEAS_PROB_FLOOR, 1.0) ** FEAS_WEIGHT_POWER
+    )
 
     Xcand_t = torch.tensor(Xcand, dtype=dtype)
     with torch.no_grad():
@@ -705,9 +737,11 @@ def main():
     if init_idx.size == 0:
         raise RuntimeError("No initialization points found.")
 
-    p_obs = feas_clf.predict_proba(X)[:, 1]
+    p_obs = p_feas_fn(X)
     score_obs = y_ms_std + y_y_std
-    z_obs = score_obs * (np.clip(p_obs, 1e-6, 1.0) ** FEAS_WEIGHT_POWER)
+    z_obs = score_obs * (
+        np.clip(p_obs, FEAS_PROB_FLOOR, 1.0) ** FEAS_WEIGHT_POWER
+    )
     start_idx = init_idx[np.argmax(z_obs[init_mask_c])]
     path_idx = np.concatenate([[start_idx], refine_idx_sorted])
 
@@ -722,7 +756,7 @@ def main():
     # the rectangular plotting window without convex-hull seams in 3D.
     grid_xy = np.column_stack([X1n.ravel(), X2n.ravel()])
     x3_rbf = RBFInterpolator(
-        X[:, :2], x3_norm_all, kernel="thin_plate_spline", smoothing=0.035)
+        X[:, :2], x3_norm_all, kernel="thin_plate_spline", smoothing=RBF_SMOOTHING)
     x3_interp = x3_rbf(grid_xy)
     x3_interp = np.clip(x3_interp, 0.0, 1.0)
     grid_norm = np.column_stack([X1n.ravel(), X2n.ravel(), x3_interp])
@@ -733,8 +767,11 @@ def main():
         mu_y = model_y.posterior(grid_t).mean.squeeze(-1).cpu().numpy()
 
     score_mu = mu_ms + mu_y
-    p_grid = feas_clf.predict_proba(grid_norm)[:, 1]
-    Z = (score_mu * (np.clip(p_grid, 1e-6, 1.0) ** FEAS_WEIGHT_POWER)).reshape(N_GRID, N_GRID)
+    p_grid = p_feas_fn(grid_norm)
+    Z = (
+        score_mu
+        * (np.clip(p_grid, FEAS_PROB_FLOOR, 1.0) ** FEAS_WEIGHT_POWER)
+    ).reshape(N_GRID, N_GRID)
 
     X1_raw = X1n * x_rng[0] + x_min[0]
     X2_raw = X2n * x_rng[1] + x_min[1]
